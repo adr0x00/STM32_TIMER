@@ -16,16 +16,16 @@
   ******************************************************************************
   */
 
- /* Логика программы для CD-ROM
-  * - Опрос кнопок через прерывание , а не постоянный в программме.
-  * - Нажали кнопку и если сигнал open то открываем , ну и анологично закрытию.
+ /*   FIX-BUG
+  * - Опрос кнопок через прерывание , а не постоянный в программме. - решить антидребезг аппратно.
+  * - Таймер будет отсчитывать секунды - прерывания по переполнению таймера, а лучше захвату. ! выполнил
+  *   1 - включить таймер с тиком в 1 мс , по достижении 1000 мс вызываем прерывание. TIM1
   * - во время открытия мигаем светодиодом
-  * - M1-M2 - 10 -закрыть , 01 - открыть.
-  * - Добавить I2C дислей и набор кнопок.
   * */
 
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
+
 #include "main.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -39,7 +39,8 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define DEBOUNCE_DELAY 20   // мс, время антидребезга
+
+// Глобальные флаги для кнопок
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -49,6 +50,7 @@
 
 /* Private variables ---------------------------------------------------------*/
 I2C_HandleTypeDef hi2c1;
+TIM_HandleTypeDef htim1;
 
 /* USER CODE BEGIN PV */
 
@@ -57,28 +59,38 @@ typedef enum {
     RUNNING
 } TimerState;
 
+typedef enum {
+	OFF ,
+	ON
+} Led_State;
+
 TimerState state = STOPPED; // СОСТОЯНИЕ ПРОГРАММЫ
+Led_State  led_state = OFF; // СОСТОЯНИЕ УФ-ЛАМПЫ
 
 
 /* USER CODE END PV */
 uint8_t minutes = 0;    // минуты
 uint8_t seconds = 0;    // секунды
 
-// СОСТОЯНИЕ КНОПКИ
-uint8_t current_state = 0;
-uint8_t last_state    = 0;
+uint8_t display_update_flag = 0;
+uint8_t btn_start_stop_flag = 0;
+uint8_t btn_seconds_flag = 0;
+uint8_t btn_minutes_flag = 0;
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_I2C1_Init(void);
+static void MX_TIM1_Init(void);
 
 void display_time_update(void);// Обновление дисплея
 void display_user_enter(void); // Хелло для пользователя
+
+void display_update_minutes(void);
+void display_update_seconds(void);
 void Button_Minutes(void);
 void Button_Seconds(void);
 void Button_StartStop(void);
-uint8_t Button_Tick( uint16_t GPIO_Pin );
 
 /* USER CODE BEGIN PFP */
 
@@ -119,10 +131,13 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_I2C1_Init();
+  MX_TIM1_Init();
   /* USER CODE BEGIN 2 */
 
   HD44780_Init(2);
 
+  HD44780_Clear();
+  display_user_enter();
   /* USER CODE END 2 */
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
@@ -135,46 +150,55 @@ int main(void)
 	   * ОТСЧЕТ ЗАДАННОГО ВРЕМЕНИ
 	   * ПО ОКОНЧАНИЮ ВЫВОДИМ СИГНАЛ НА ПИН КОТОРЫЙ УПРАВЛЯЕТ ДРАЙВЕРОМ
 	   * */
-
-
-	     if (   Button_Tick(BUTTON_MINUTES_PIN) ){
-			    Button_Minutes();
-		  }
-
-		  if (  Button_Tick (BUTTON_SECONDS_PIN) ){
-		  	    Button_Seconds();
-		  }
-
-		  if (  Button_Tick(BUTTON_START_STOP_PIN ) ){
-			    Button_StartStop();
-		  }
-
 		  if (state == RUNNING) {
 			     // ЗДЕСЬ ПРОИСХОДИТ ВСЕ ВОВРЕМЯ ОТСЧЕТА
-			   display_time_update();
-			   HAL_GPIO_WritePin(GPIOA , DRIVER_PIN , GPIO_PIN_SET);  // ВКЛЮЧАЕМ ЛАМПУ
-			        if (seconds == 0) {
-			             if ( minutes > 0) {
-			                  minutes--;
-			                  seconds = 59;
-			              } else {
-			                  state = STOPPED;
-			                  // здесь можно включить пищалку или мигание светодиода
+			   if ( display_update_flag ){    // Обновляем каждую секунду по прерыванию таймера
 
-			                 HAL_GPIO_WritePin(GPIOA , DRIVER_PIN , GPIO_PIN_RESET);  // ВЫКЛЮЧАЕМ ЛАМПУ
-			              }
-			          } else {
-			              seconds--;
+				    display_update_flag = 0;
+				    display_time_update();
 
-			          }
-			      } else {
-			    	   // ЗДЕСЬ ПРОИСХОДИТ ВСЕ ЧТО ДО ОТСЧЕТА - ПРИВЕТСВИЕ И ТД
-			    	      display_user_enter();
-			      }
+				    if( seconds == 0 && minutes == 0){
+				    	HD44780_Clear();
+				    	display_user_enter();
+				    }
+			   }
 
+			        led_state = ON;
 
+	       } else {
 
-		  HAL_Delay(1000);        // обновление каждую секунду
+	    	        led_state = OFF;
+	       }
+
+		       // ВВОД ДАННЫХ ОТ ПОЛЬЗОВАТЕЛЯ
+		  if ( btn_start_stop_flag ) {
+			   btn_start_stop_flag = 0; // Обрабатываем флаг
+			   Button_StartStop();
+		  }
+
+		  if ( btn_seconds_flag ) {
+
+			   btn_seconds_flag =  0;// Обрабатываем флаг
+			   Button_Seconds();
+			   // Отображаем изменения
+			   display_update_seconds();
+		  }
+
+		  if ( btn_minutes_flag ) {
+		  	   btn_minutes_flag = 0; // Обрабатываем флаг
+		  	   Button_Minutes();
+		  	   // Отображаем изменения
+		  	   display_update_minutes();
+		  }
+
+		   if( led_state ) {
+
+			   HAL_GPIO_WritePin(GPIOA , DRIVER_PIN , GPIO_PIN_SET);  // ВКЛЮЧАЕМ УФ-ЛАМПУ
+
+		   } else {
+
+			   HAL_GPIO_WritePin(GPIOA , DRIVER_PIN , GPIO_PIN_RESET);  // ВЫКЛЮЧАЕМ УФ-ЛАМПУ
+		   }
 
     /* USER CODE BEGIN 3 */
   }
@@ -249,21 +273,21 @@ static void MX_I2C1_Init(void)
   hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
   if (HAL_I2C_Init(&hi2c1) != HAL_OK)
   {
-    Error_Handler();
+     Error_Handler();
   }
 
   /** Configure Analogue filter
   */
   if (HAL_I2CEx_ConfigAnalogFilter(&hi2c1, I2C_ANALOGFILTER_ENABLE) != HAL_OK)
   {
-    Error_Handler();
+     Error_Handler();
   }
 
   /** Configure Digital filter
   */
   if (HAL_I2CEx_ConfigDigitalFilter(&hi2c1, 0) != HAL_OK)
   {
-    Error_Handler();
+     Error_Handler();
   }
   /* USER CODE BEGIN I2C1_Init 2 */
 
@@ -299,13 +323,51 @@ static void MX_GPIO_Init(void)
 
   /*Configure GPIO pins : BUTTON_START_STOP_Pin BUTTON_SECONDS_Pin BUTTON_MINUTES_Pin */
   GPIO_InitStruct.Pin = BUTTON_START_STOP_PIN|BUTTON_SECONDS_PIN|BUTTON_MINUTES_PIN;
-  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
   GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /* EXTI interrupt init*/
+  HAL_NVIC_SetPriority(EXTI0_1_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(EXTI0_1_IRQn);
+
+  HAL_NVIC_SetPriority(EXTI2_3_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(EXTI2_3_IRQn);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
   /* USER CODE END MX_GPIO_Init_2 */
+}
+
+static void MX_TIM1_Init(void){
+     // Инициализация структуры таймера
+	__HAL_RCC_TIM1_CLK_ENABLE();  // Включение тактирования таймера.
+	/* конфигурация TIM1 */
+	htim1.Instance = TIM1;
+	htim1.Init.Prescaler = 8000 - 1;                         // 1 тик = 1мс
+	htim1.Init.CounterMode = TIM_COUNTERMODE_UP;             // счет вверх
+	htim1.Init.Period = 1000 - 1;                            // период 1с
+	htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+	htim1.Init.RepetitionCounter = 0;
+	htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+	if (HAL_TIM_Base_Init(&htim1) != HAL_OK) {
+
+	    // ошибка инициализации
+	}
+
+	 // ключение тактирования
+	 TIM_ClockConfigTypeDef sClockSourceConfig = {0};   // Тактирование таймера ;
+	 sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+	 if (HAL_TIM_ConfigClockSource(&htim1, &sClockSourceConfig) != HAL_OK) {
+	 // ошибка инициализации
+	 }
+
+	 // Разрешить работу прерываний
+	 HAL_NVIC_SetPriority(TIM1_BRK_UP_TRG_COM_IRQn, 0, 0);
+	 HAL_NVIC_EnableIRQ(TIM1_BRK_UP_TRG_COM_IRQn);
+
+	 HAL_TIM_Base_Start_IT (&htim1); // Запуск в режиме прерываний
+
 }
 
 /* USER CODE BEGIN 4 */
@@ -315,7 +377,7 @@ void display_time_update(void) {
 	 char time_buffer[16];
 	 sprintf(time_buffer, "%02d:%02d", minutes, seconds);
 
-	 HD44780_Clear();
+     HD44780_Clear();
 	 HD44780_SetCursor(0,1);
 	 HD44780_PrintStr("  TIMER:");
 	 HD44780_SetCursor(9,1);
@@ -334,7 +396,6 @@ void display_user_enter(void) {
 	sprintf(min_buffer, "%02d", minutes);
 	sprintf(sec_buffer, "%02d", seconds);
 
-	HD44780_Clear();
 	HD44780_SetCursor(0,0);
 	HD44780_PrintStr(" PLS ENTER TIME ");
 
@@ -348,6 +409,26 @@ void display_user_enter(void) {
 	HD44780_SetCursor(13,1);
 	HD44780_PrintStr(min_buffer);  // Только минуты
 } // обновление дисплея приветсвия
+
+void display_update_seconds(void){
+	 char sec_buffer[8];
+	 sprintf(sec_buffer, "%02d", seconds);
+
+	 HD44780_SetCursor(0,1);
+	 HD44780_PrintStr("SEC:");
+	 HD44780_SetCursor(5,1);
+	 HD44780_PrintStr(sec_buffer);
+}
+
+void display_update_minutes(void){
+	 char min_buffer[8];
+	 sprintf(min_buffer, "%02d", minutes);
+
+     HD44780_SetCursor(8,1);
+	 HD44780_PrintStr("MIN:");
+	 HD44780_SetCursor(13,1);
+	 HD44780_PrintStr(min_buffer);
+}
 
 void Button_Minutes(void){
 
@@ -378,30 +459,75 @@ void Button_StartStop(void){
 
 }
 
-uint8_t Button_Tick( uint16_t GPIO_Pin ){
-
-	    static uint32_t lastTick = 0;
-	    static uint8_t lastState = 1;  // 1 = отпущена (pull-up)
-
-	    uint8_t currentState;
-
-	    currentState = HAL_GPIO_ReadPin(GPIOA, GPIO_Pin);
-
-	    if (currentState != lastState) {
-	        // если состояние изменилось → проверим по таймеру
-	        if (HAL_GetTick() - lastTick > DEBOUNCE_DELAY) {
-	            lastTick = HAL_GetTick();
-	            lastState = currentState;
-
-	            if (currentState == 0) {
-	                return 1; // кнопка нажата
-	            }
-	        }
-	    }
-
-	    return 0; // кнопка не нажата
-}
 /* USER CODE END 4 */
+
+                                  /* INTERRUPT */
+
+// Обработчик для пинов 0-1
+void EXTI0_1_IRQHandler(void) {
+     HAL_GPIO_EXTI_IRQHandler(BUTTON_START_STOP_PIN);
+}
+
+// Обработчик для пинов 2-3
+void EXTI2_3_IRQHandler(void) {
+
+	if (__HAL_GPIO_EXTI_GET_IT(BUTTON_SECONDS_PIN) != RESET) {
+        HAL_GPIO_EXTI_IRQHandler(BUTTON_SECONDS_PIN);
+    }
+    if (__HAL_GPIO_EXTI_GET_IT(BUTTON_MINUTES_PIN) != RESET) {
+        HAL_GPIO_EXTI_IRQHandler(BUTTON_MINUTES_PIN);
+    }
+}
+
+// 6. Callback-функции
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
+
+	 switch(GPIO_Pin) {
+
+	         case BUTTON_START_STOP_PIN:
+	            // Поднимаем флаг программе
+	        	  btn_start_stop_flag = 1;
+	            break;
+
+	        case  BUTTON_SECONDS_PIN:
+	        	// Поднимаем флаг программе
+	        	  btn_seconds_flag =  1;
+	            break;
+
+	        case BUTTON_MINUTES_PIN:
+	        	// Поднимаем флаг программе
+	        	   btn_minutes_flag = 1;
+	            break;
+	    }
+}
+
+   // ТАЙМЕР И ЕГО ОБРАБОТЧИК
+
+void TIM1_BRK_UP_TRG_COM_IRQHandler(void) {
+
+	 HAL_TIM_IRQHandler(&htim1);
+}
+
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
+
+	if (htim->Instance == TIM1) {
+        // Вызывается каждую секунду!
+        if (state == RUNNING) {
+
+        	if (seconds > 0) {
+                seconds--;
+            } else if (minutes > 0) {
+                minutes--;
+                seconds = 59;
+
+            } else {
+                state = STOPPED;
+            }
+            // Обновление дисплея
+             display_update_flag = 1;
+        }
+    }
+}
 
 /**
   * @brief  This function is executed in case of error occurrence.
